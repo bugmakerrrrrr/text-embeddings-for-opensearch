@@ -1,28 +1,30 @@
 import json
 import time
 
-from elasticsearch import Elasticsearch
-from elasticsearch.helpers import bulk
+from pathlib import Path
 
-# Use tensorflow 1 behavior to match the Universal Sentence Encoder
-# examples (https://tfhub.dev/google/universal-sentence-encoder/2).
-import tensorflow.compat.v1 as tf
+from opensearchpy import OpenSearch
+from opensearchpy.helpers import bulk
+
+# Use tensorflow 2 behavior to match the Universal Sentence Encoder
+# examples (https://www.kaggle.com/models/google/universal-sentence-encoder/frameworks/tensorFlow2/variations/universal-sentence-encoder/versions/2).
+import tensorflow as tf
 import tensorflow_hub as hub
 
-##### INDEXING #####
 
+##### INDEXING #####
 def index_data():
     print("Creating the 'posts' index.")
     client.indices.delete(index=INDEX_NAME, ignore=[404])
 
-    with open(INDEX_FILE) as index_file:
+    with open(index_file_path) as index_file:
         source = index_file.read().strip()
         client.indices.create(index=INDEX_NAME, body=source)
 
     docs = []
     count = 0
 
-    with open(DATA_FILE) as data_file:
+    with open(data_file_path) as data_file:
         for line in data_file:
             line = line.strip()
 
@@ -45,27 +47,31 @@ def index_data():
     client.indices.refresh(index=INDEX_NAME)
     print("Done indexing.")
 
+
 def index_batch(docs):
     titles = [doc["title"] for doc in docs]
     title_vectors = embed_text(titles)
 
     requests = []
-    for i, doc in enumerate(docs):
+    for doc, vec in zip(docs, title_vectors):
         request = doc
         request["_op_type"] = "index"
         request["_index"] = INDEX_NAME
-        request["title_vector"] = title_vectors[i]
+        request["title_vector"] = vec
         requests.append(request)
     bulk(client, requests)
 
-##### SEARCHING #####
 
+##### SEARCHING #####
 def run_query_loop():
     while True:
         try:
             handle_query()
         except KeyboardInterrupt:
+            print()
+            print("finished")
             return
+
 
 def handle_query():
     query = input("Enter query: ")
@@ -74,12 +80,11 @@ def handle_query():
     query_vector = embed_text([query])[0]
     embedding_time = time.time() - embedding_start
 
-    script_query = {
-        "script_score": {
-            "query": {"match_all": {}},
-            "script": {
-                "source": "cosineSimilarity(params.query_vector, doc['title_vector']) + 1.0",
-                "params": {"query_vector": query_vector}
+    knn_query = {
+        "knn": {
+            "title_vector": {
+                "vector": query_vector,
+                "k": SEARCH_SIZE
             }
         }
     }
@@ -89,7 +94,7 @@ def handle_query():
         index=INDEX_NAME,
         body={
             "size": SEARCH_SIZE,
-            "query": script_query,
+            "query": knn_query,
             "_source": {"includes": ["title", "body"]}
         }
     )
@@ -104,44 +109,38 @@ def handle_query():
         print(hit["_source"])
         print()
 
-##### EMBEDDING #####
 
+##### EMBEDDING #####
 def embed_text(text):
-    vectors = session.run(embeddings, feed_dict={text_ph: text})
-    return [vector.tolist() for vector in vectors]
+    vectors = embed(text).numpy()
+    return vectors.tolist()
+
 
 ##### MAIN SCRIPT #####
-
 if __name__ == '__main__':
     INDEX_NAME = "posts"
     INDEX_FILE = "data/posts/index.json"
-
     DATA_FILE = "data/posts/posts.json"
+    base_path = Path(__file__).parent
+    index_file_path = (base_path / ("../" + INDEX_FILE)).resolve()
+    data_file_path = (base_path / ("../" + DATA_FILE)).resolve()
+
     BATCH_SIZE = 1000
-
     SEARCH_SIZE = 5
-
     GPU_LIMIT = 0.5
 
-    print("Downloading pre-trained embeddings from tensorflow hub...")
-    embed = hub.Module("https://tfhub.dev/google/universal-sentence-encoder/2")
-    text_ph = tf.placeholder(tf.string)
-    embeddings = embed(text_ph)
-    print("Done.")
+    print("Loading Universal Sentence Encoder model...")
+    embed = hub.load("https://tfhub.dev/google/universal-sentence-encoder/4")
+    print("Done")
 
-    print("Creating tensorflow session...")
-    config = tf.ConfigProto()
-    config.gpu_options.per_process_gpu_memory_fraction = GPU_LIMIT
-    session = tf.Session(config=config)
-    session.run(tf.global_variables_initializer())
-    session.run(tf.tables_initializer())
-    print("Done.")
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        tf.config.experimental.set_virtual_device_configuration(
+            gpus[0],
+            [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=int(GPU_LIMIT * 1024))]
+        )
 
-    client = Elasticsearch()
+    client = OpenSearch(hosts=[{'host': '', 'port': 9200}])
 
     index_data()
     run_query_loop()
-
-    print("Closing tensorflow session...")
-    session.close()
-    print("Done.")
